@@ -17,6 +17,7 @@
 package com.rbmhtechnology.eventuate
 
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.function.{Function => JFunction}
 
 import akka.actor._
@@ -28,6 +29,7 @@ import com.typesafe.config.Config
 
 import scala.collection.JavaConverters._
 import scala.collection.immutable.Seq
+import scala.concurrent._
 import scala.concurrent.duration._
 
 import ReplicationProtocol._
@@ -147,10 +149,15 @@ object ReplicationEndpoint {
  * @param connections Replication connections to other replication endpoints.
  */
 class ReplicationEndpoint(val id: String, val logNames: Set[String], val logFactory: String => Props, val connections: Set[ReplicationConnection])(implicit val system: ActorSystem) {
-  private val acceptor: TargetAcceptor =
-    new TargetAcceptor(this)
+  import Acceptor._
 
-  private val connectors: Set[SourceConnector] =
+  private val active: AtomicBoolean =
+    new AtomicBoolean(false)
+
+  private[eventuate] val acceptor: ActorRef =
+    system.actorOf(Props(new Acceptor(this)), name = Acceptor.Name)
+
+  private[eventuate] val connectors: Set[SourceConnector] =
     connections.map(new SourceConnector(this, _))
 
   /**
@@ -169,7 +176,7 @@ class ReplicationEndpoint(val id: String, val logNames: Set[String], val logFact
    * The log actors managed by this endpoint, indexed by their name.
    */
   val logs: Map[String, ActorRef] =
-    logNames.map(logName => logName -> system.actorOf(logFactory(logId(logName)), name = logId(logName))).toMap
+    logNames.map(logName => logName -> system.actorOf(logFactory(logId(logName)))).toMap
 
   /**
    * Returns the unique log id for given `logName`.
@@ -178,33 +185,64 @@ class ReplicationEndpoint(val id: String, val logNames: Set[String], val logFact
     info.logId(logName)
 
   /**
-   * Returns the [[ReplicationTarget]] for given `logName`.
+   * ...
    */
-  def target(logName: String): ReplicationTarget =
+  def recover(): Future[Unit] = if (!active.getAndSet(true)) {
+    import system.dispatcher
+
+    val promise = Promise[Unit]()
+    val recovery = new Recovery(this)
+
+    val phase1 = for {
+      infos    <- recovery.readEndpointInfos
+      trackers <- recovery.readTimeTrackers
+      links     = recovery.recoveryLinks(infos, trackers)
+      _        <- recovery.deleteSnapshots(links)
+    } yield links
+
+    val phase2 = for {
+      _ <- phase1
+      r <- promise.future
+    } yield { active.set(false); r }
+
+    phase1.onSuccess { case links => acceptor ! Recover(links, promise) }
+    phase2
+  } else Future.failed(new IllegalStateException("Recovery running or endpoint already activated"))
+
+  /**
+   * ...
+   */
+  def activate(): Unit = if (!active.getAndSet(true)) {
+    acceptor ! Process
+    connectors.foreach(_.activate())
+  } else throw new IllegalStateException("Recovery running or endpoint already activated")
+
+  /**
+   * Creates [[ReplicationTarget]] for given `logName`.
+   */
+  private[eventuate] def target(logName: String): ReplicationTarget =
     ReplicationTarget(this, logName, logId(logName), logs(logName))
 
   /**
-   * Activates this endpoint by establishing and accepting replication connections.
+   * Returns all log names this endpoint and `endpointInfo` have in common.
    */
-  def activate(): Unit = {
-    acceptor.activate()
-    connectors.foreach(_.activate())
-  }
+  private[eventuate] def commonLogNames(endpointInfo: ReplicationEndpointInfo) =
+    this.logNames.intersect(endpointInfo.logNames)
 }
 
 /**
  * References a remote event log at a source [[ReplicationEndpoint]].
  */
-case class ReplicationSource(
+private case class ReplicationSource(
   endpointId: String,
   logName: String,
   logId: String,
-  log: ActorSelection)
+  acceptor: ActorSelection)
 
 /**
  * References a local event log at a target [[ReplicationEndpoint]].
  */
-case class ReplicationTarget(
+private case class ReplicationTarget(
   endpoint: ReplicationEndpoint,
   logName: String,
   logId: String,
@@ -215,32 +253,23 @@ case class ReplicationTarget(
  * Represents an unidirectional replication link where events are
  * replicated from a `source` to a `target`.
  */
-case class ReplicationLink(
+private case class ReplicationLink(
   source: ReplicationSource,
   target: ReplicationTarget)
 
-private object TargetAcceptor {
-  val Name = "acceptor"
-}
-
-private class TargetAcceptor(sourceEndpoint: ReplicationEndpoint) {
-  def activate(): Unit =
-    sourceEndpoint.system.actorOf(Props(new Acceptor(sourceEndpoint.info)), name = TargetAcceptor.Name)
-}
-
 private class SourceConnector(val targetEndpoint: ReplicationEndpoint, val connection: ReplicationConnection) {
   def links(sourceInfo: ReplicationEndpointInfo): Set[ReplicationLink] =
-    sourceInfo.logNames.intersect(targetEndpoint.logNames).map { logName =>
+    targetEndpoint.commonLogNames(sourceInfo).map { logName =>
       val sourceLogId = sourceInfo.logId(logName)
-      val source = ReplicationSource(sourceInfo.endpointId, logName, sourceLogId, remoteActorSelection(sourceLogId))
+      val source = ReplicationSource(sourceInfo.endpointId, logName, sourceLogId, remoteAcceptor)
       ReplicationLink(source, targetEndpoint.target(logName))
     }
 
   def activate(): Unit =
     targetEndpoint.system.actorOf(Props(new Connector(this)))
 
-  def remoteTargetAcceptor: ActorSelection =
-    remoteActorSelection(TargetAcceptor.Name)
+  def remoteAcceptor: ActorSelection =
+    remoteActorSelection(Acceptor.Name)
 
   def remoteActorSelection(actor: String): ActorSelection = {
     import connection._
@@ -255,16 +284,6 @@ private class SourceConnector(val targetEndpoint: ReplicationEndpoint, val conne
 }
 
 /**
- * Serves [[GetReplicationEndpointInfo]] requests sent from [[Connector]]s target [[ReplicationEndpoint]]s.
- */
-private class Acceptor(sourceEndpointInfo: ReplicationEndpointInfo) extends Actor {
-  def receive = {
-    case GetReplicationEndpointInfo =>
-      sender() ! GetReplicationEndpointInfoSuccess(sourceEndpointInfo)
-  }
-}
-
-/**
  * Reliably sends [[GetReplicationEndpointInfo]] requests to the [[Acceptor]] at a source [[ReplicationEndpoint]].
  * On receiving a [[GetReplicationEndpointInfoSuccess]] reply, this connector sets up log [[Replicator]]s, one per
  * common log name between source and target endpoints.
@@ -272,7 +291,7 @@ private class Acceptor(sourceEndpointInfo: ReplicationEndpointInfo) extends Acto
 private class Connector(sourceConnector: SourceConnector) extends Actor {
   import context.dispatcher
 
-  private val acceptor = sourceConnector.remoteTargetAcceptor
+  private val acceptor = sourceConnector.remoteAcceptor
   private var acceptorRequestSchedule: Option[Cancellable] = None
 
   private var connected = false
@@ -383,7 +402,7 @@ private class Replicator(target: ReplicationTarget, source: ReplicationSource, f
   private def read(storedReplicationProgress: Long, currentTargetVectorTime: VectorTime): Unit = {
     implicit val timeout = Timeout(settings.readTimeout)
 
-    source.log ? ReplicationRead(storedReplicationProgress + 1, settings.batchSizeMax, filter, target.logId, self, currentTargetVectorTime) recover {
+    source.acceptor ? ReplicationReadEnvelope(ReplicationRead(storedReplicationProgress + 1, settings.batchSizeMax, filter, target.logId, self, currentTargetVectorTime), source.logName) recover {
       case t => ReplicationReadFailure(t.getMessage, target.logId)
     } pipeTo self
   }
